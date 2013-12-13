@@ -62,19 +62,24 @@ class MpClientWindow(Gtk.Window):
 
         yield from self.client.connect('localhost', 6600)
         print("connected")
+
+        resultyielder = self.client.repeat(0)
+        # harr, dropping the future. does not matter.
+        # print("repeat=0 yielded %r"%(yield from result))
+
         print("current song: %r"%(yield from self.client.currentsong()))
         print("status: %r"%(yield from self.client.status()))
 
-        #result = yield from timelogging(self.client.listall(), "listall")
-        #print("listall: %r"%len(result))
+        result = yield from self.client.listall()
+        print("listall: %r"%len(result))
 
-        print("screwing")
+        print("screwing with sequence")
 
         status = self.client.status()
-        yield status.__next__()
-
         print("current song: %r"%(yield from self.client.currentsong()))
         print("status: %r"%(yield from status))
+
+        print("idle events: %r"%(yield from self.client.idle()))
 
         return 42
 

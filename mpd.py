@@ -18,14 +18,11 @@
 # asyncio porting TODO:
 #
 # * unix sockets
-# * sequencing (currently, things only work reliably when every command is
-#   yield-from'd completely before another is sent, although it's hard to
-#   trigger the problem) -- probably this means having a queue of futures and
-#   modifying the whole concept of command execution
 # * not yet tested, probably don't work
-#   * idle
+#   * idle (works, but cancelling the task does not send a noidle command)
 #   * command lists
 #   * iterate
+# * act on all those "form into generator shape again" todos (enabling iterate)
 
 import logging
 import sys
@@ -194,10 +191,55 @@ _commands = {
     "sendmessage":        "_fetch_nothing",
 }
 
+class LineEater(asyncio.Future):
+    """Future on a generator that gets fed lines
+
+    The LineEater is a Future that can be used to dispatch lines in a protocol
+    where different routines take turns in consuming lines, but only those
+    routines can determine whether they are done with it. (That's not exactly
+    the case in the MPD protocol, but makes adapting the current implementation
+    easier).
+
+    The generators used here are *not* coroutines -- while coroutines yield
+    futures (for whose completion they wait and whose values they get passed
+    back in), these generators yield nothing, and wait for a next line to be
+    passed in. This allows orderly execution: When it is a LineEater's turn to
+    consume lines, `feed` it lines until it returns False, which means that the
+    generator has ended and that the next eater in line should receive
+    subsequent lines.
+
+    When the generator exits, its result will be used to finish the future
+    which the LineEater is. (In case of an error, that will set an exception on
+    the future).
+
+    Note that the generators inside a LineEater can easily nest using `yield
+    from` the same way a asyncio.coroutine nests. Instead of an innermost
+    `yield from my_socket.read()` (which leads to competition among tasks),
+    there is simply a `yield`.
+    """
+
+    def __init__(self, generator):
+        super().__init__()
+
+        self._generator = generator
+
+    def feed(self, line):
+        try:
+            self._generator.send(line)
+        except StopIteration as s:
+            self.set_result(s.value)
+            return False
+        except Exception as e:
+            self.set_exception(e)
+            return False
+
+        return True
+
 class MPDClient(object):
     def __init__(self, use_unicode=False):
         self.iterate = False
         self.use_unicode = use_unicode
+        self._readtask = None
         self._reset()
 
     def _send(self, command, args, retval):
@@ -247,6 +289,33 @@ class MPDClient(object):
             raise NotImplementedError() # yield from
             return retval
 
+    def _execute_async(self, command, args, retval):
+        """Append the command and create a LineEater from the retval function.
+        See the LineEater documentation on how those should behave."""
+        self._pending = None # destroy whatever uses it so things break early.
+                             # those don't go together.
+        self._write_command(command, args)
+
+        generator = retval()
+        generator.__next__() # start generator
+
+        result = LineEater(generator)
+
+        self._lineeaters.append(result)
+
+        return result
+
+    @coroutine
+    def _feed_lineeaters(self):
+        while True:
+            line = yield from self._read_line()
+            if not self._lineeaters:
+                self.disconnect()
+                raise ConnectionError("Unexpected chatting")
+            want_more = self._lineeaters[0].feed(line)
+            if not want_more:
+                self._lineeaters.pop(0)
+
     def _write_line(self, line):
         self._wfile.write(("%s\n" % line).encode('utf-8'))
         #self._wfile.flush()
@@ -292,7 +361,7 @@ class MPDClient(object):
         return line
 
     def _read_pair(self, separator):
-        line = yield from self._read_line()
+        line = yield
         if line is None:
             return
         pair = line.split(separator, 1)
@@ -384,7 +453,7 @@ class MPDClient(object):
         return self._iterator_wrapper(iterator)
 
     def _fetch_nothing(self):
-        line = yield from self._read_line()
+        line = yield
         if line is not None:
             raise ProtocolError("Got unexpected return value: '%s'" % line)
 
@@ -421,9 +490,9 @@ class MPDClient(object):
         return self._fetch_objects(["cpos"])
 
     def _fetch_idle(self):
-        self._sock.settimeout(self.idletimeout)
+        #self._sock.settimeout(self.idletimeout)
         ret = self._fetch_list()
-        self._sock.settimeout(self._timeout)
+        #self._sock.settimeout(self._timeout)
         return ret
 
     def _fetch_songs(self):
@@ -469,6 +538,7 @@ class MPDClient(object):
         self._iterating = False
         self._pending = []
         self._command_list = None
+        self._lineeaters = []
         self._sock = None
         self._rfile = _NotConnected()
         self._wfile = _NotConnected()
@@ -527,14 +597,16 @@ class MPDClient(object):
             self.disconnect()
             raise
 
+        self._readtask = asyncio.Task(self._feed_lineeaters())
+
     def disconnect(self):
         logger.info("Calling MPD disconnect()")
-        if not self._rfile is None:
-            self._rfile.close()
+
+        if self._readtask:
+            self._readtask.cancel()
+
         if not self._wfile is None:
             self._wfile.close()
-        if not self._sock is None:
-            self._sock.close()
         self._reset()
 
     def fileno(self):
@@ -566,13 +638,20 @@ class MPDClient(object):
         method = newFunction(cls._execute, key, callback)
         send_method = newFunction(cls._send, key, callback)
         fetch_method = newFunction(cls._fetch, key, callback)
+        async_method = newFunction(cls._execute_async, key, callback)
 
         # create new mpd commands as function in three flavors:
         # normal, with "send_"-prefix and with "fetch_"-prefix
         escaped_name = name.replace(" ", "_")
-        setattr(cls, escaped_name, method)
-        setattr(cls, "send_"+escaped_name, send_method)
-        setattr(cls, "fetch_"+escaped_name, fetch_method)
+        #setattr(cls, escaped_name, method)
+        #setattr(cls, "send_"+escaped_name, send_method)
+        #setattr(cls, "fetch_"+escaped_name, fetch_method)
+
+        # it might be worth considering to have a MPDClient class and a
+        # MPDAsyncClient class, which differ in that the async methods are
+        # hidden groundwork in the compatibility MPDClient, which instead
+        # exposes wrapper methods
+        setattr(cls, escaped_name, async_method)
 
     @classmethod
     def remove_command(cls, name):
