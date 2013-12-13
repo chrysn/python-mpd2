@@ -15,11 +15,26 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with python-mpd2.  If not, see <http://www.gnu.org/licenses/>.
 
+# asyncio porting TODO:
+#
+# * unix sockets
+# * sequencing (currently, things only work reliably when every command is
+#   yield-from'd completely before another is sent, although it's hard to
+#   trigger the problem) -- probably this means having a queue of futures and
+#   modifying the whole concept of command execution
+# * not yet tested, probably don't work
+#   * idle
+#   * command lists
+#   * iterate
+
 import logging
 import sys
 import socket
 import warnings
 from collections import Callable
+import asyncio
+import asyncio.streams
+from asyncio import coroutine
 
 VERSION = (0, 5, 3)
 HELLO_PREFIX = "OK MPD "
@@ -218,6 +233,7 @@ class MPDClient(object):
             raise PendingCommandError("Cannot execute '%s' with "
                                       "pending commands" % command)
         if self._command_list is not None:
+            raise NotImplementedError() # yield from
             if not isinstance(retval, Callable):
                 raise CommandListError("'%s' not allowed in command list" %
                                         command)
@@ -226,12 +242,14 @@ class MPDClient(object):
         else:
             self._write_command(command, args)
             if isinstance(retval, Callable):
-                return retval()
+                ## @todo implement any other case
+                return (yield from retval())
+            raise NotImplementedError() # yield from
             return retval
 
     def _write_line(self, line):
-        self._wfile.write("%s\n" % line)
-        self._wfile.flush()
+        self._wfile.write(("%s\n" % line).encode('utf-8'))
+        #self._wfile.flush()
 
     def _write_command(self, command, args=[]):
         parts = [command]
@@ -252,7 +270,9 @@ class MPDClient(object):
         self._write_line(" ".join(parts))
 
     def _read_line(self):
-        line = self._rfile.readline()
+        ## @todo things block anyway because readline is inefficient when
+        # dealing with more data
+        line = (yield from self._rfile.readline()).decode('utf-8')
         if self.use_unicode:
             line = decode_str(line)
         if not line.endswith("\n"):
@@ -272,7 +292,7 @@ class MPDClient(object):
         return line
 
     def _read_pair(self, separator):
-        line = self._read_line()
+        line = yield from self._read_line()
         if line is None:
             return
         pair = line.split(separator, 1)
@@ -281,32 +301,42 @@ class MPDClient(object):
         return pair
 
     def _read_pairs(self, separator=": "):
-        pair = self._read_pair(separator)
+        result = []
+        pair = yield from self._read_pair(separator)
         while pair:
-            yield pair
-            pair = self._read_pair(separator)
+            result.append(pair)
+            pair = yield from self._read_pair(separator)
+        ## @todo form into generator shape again
+        return result
 
     def _read_list(self):
         seen = None
-        for key, value in self._read_pairs():
+        result = []
+        for key, value in (yield from self._read_pairs()):
             if key != seen:
                 if seen is not None:
                     raise ProtocolError("Expected key '%s', got '%s'" %
                                         (seen, key))
                 seen = key
-            yield value
+            result.append(value)
+        ## @todo form into generator shape again
+        return result
 
     def _read_playlist(self):
-        for key, value in self._read_pairs(":"):
-            yield value
+        result = []
+        for key, value in (yield from self._read_pairs(":")):
+            result.append(value)
+        ## @todo form into generator shape again
+        return result
 
     def _read_objects(self, delimiters=[]):
+        result = []
         obj = {}
-        for key, value in self._read_pairs():
+        for key, value in (yield from self._read_pairs()):
             key = key.lower()
             if obj:
                 if key in delimiters:
-                    yield obj
+                    result.append(obj)
                     obj = {}
                 elif key in obj:
                     if not isinstance(obj[key], list):
@@ -316,7 +346,9 @@ class MPDClient(object):
                     continue
             obj[key] = value
         if obj:
-            yield obj
+            result.append(obj)
+        ## @todo form into generator shape again
+        return result
 
     def _read_command_list(self):
         try:
@@ -327,13 +359,15 @@ class MPDClient(object):
         self._fetch_nothing()
 
     def _read_stickers(self):
-        for key, sticker in self._read_pairs():
+        result = []
+        for key, sticker in (yield from self._read_pairs()):
             value = sticker.split('=', 1)
 
             if len(value) < 2:
                 raise ProtocolError("Could not parse sticker: %r" % sticker)
 
-            yield tuple(value)
+            result.append(value)
+        return result
 
     def _iterator_wrapper(self, iterator):
         try:
@@ -343,18 +377,19 @@ class MPDClient(object):
             self._iterating = False
 
     def _wrap_iterator(self, iterator):
+        ## @todo make this actually usable with asyncio
         if not self.iterate:
-            return list(iterator)
+            return iterator
         self._iterating = True
         return self._iterator_wrapper(iterator)
 
     def _fetch_nothing(self):
-        line = self._read_line()
+        line = yield from self._read_line()
         if line is not None:
             raise ProtocolError("Got unexpected return value: '%s'" % line)
 
     def _fetch_item(self):
-        pairs = list(self._read_pairs())
+        pairs = list((yield from self._read_pairs()))
         if len(pairs) != 1:
             return
         return pairs[0][1]
@@ -374,7 +409,7 @@ class MPDClient(object):
         return self._wrap_iterator(self._read_playlist())
 
     def _fetch_object(self):
-        objs = list(self._read_objects())
+        objs = list((yield from self._read_objects()))
         if not objs:
             return {}
         return objs[0]
@@ -420,7 +455,7 @@ class MPDClient(object):
         return self._fetch_list()
 
     def _hello(self):
-        line = self._rfile.readline()
+        line = (yield from self._rfile.readline()).decode('utf-8')
         if not line.endswith("\n"):
             self.disconnect()
             raise ConnectionError("Connection lost while reading MPD hello")
@@ -447,36 +482,22 @@ class MPDClient(object):
         sock.connect(path)
         return sock
 
+    @coroutine
     def _connect_tcp(self, host, port):
+        self._sock = True
+
         try:
-            flags = socket.AI_ADDRCONFIG
-        except AttributeError:
-            flags = 0
-        err = None
-        for res in socket.getaddrinfo(host, port, socket.AF_UNSPEC,
-                                      socket.SOCK_STREAM, socket.IPPROTO_TCP,
-                                      flags):
-            af, socktype, proto, canonname, sa = res
-            sock = None
-            try:
-                sock = socket.socket(af, socktype, proto)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                sock.settimeout(self.timeout)
-                sock.connect(sa)
-                return sock
-            except socket.error as e:
-                err = e
-                if sock is not None:
-                    sock.close()
-        if err is not None:
-            raise err
-        else:
-            raise ConnectionError("getaddrinfo returns an empty list")
+            self._rfile, self._wfile = yield from asyncio.streams.open_connection(host, port)
+            ## @todo set sockopt SO_KEEPALIVE, and set socket timeout
+        except:
+            self._reset()
+            raise
 
     def _settimeout(self, timeout):
         self._timeout = timeout
         if self._sock != None:
-            self._sock.settimeout(timeout)
+            ## @todo set timeout
+            pass
     def _gettimeout(self):
         return self._timeout
     timeout = property(_gettimeout, _settimeout)
@@ -496,20 +517,13 @@ class MPDClient(object):
         if host.startswith("/"):
             self._sock = self._connect_unix(host)
         else:
-            self._sock = self._connect_tcp(host, port)
-
-        if IS_PYTHON2:
-            self._rfile = self._sock.makefile("r")
-            self._wfile = self._sock.makefile("w")
-        else:
-            # Force UTF-8 encoding, since this is dependant from the LC_CTYPE
-            # locale.
-            self._rfile = self._sock.makefile("r", encoding="utf-8")
-            self._wfile = self._sock.makefile("w", encoding="utf-8")
+            yield from self._connect_tcp(host, port)
 
         try:
-            self._hello()
-        except:
+            yield from self._hello()
+        except Exception as e:
+            print("something went wrong: %s"%e)
+            ## @todo unqualified except!
             self.disconnect()
             raise
 
