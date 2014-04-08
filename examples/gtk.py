@@ -51,6 +51,9 @@ class MpClientWindow(Gtk.Window):
         def done(result):
             # make sure the exception does not get lost
             print("done, result is %s"%result)
+            if result.exception() is not None:
+                import traceback
+                traceback.print_tb(result.exception().__traceback__)
         self.connecting.add_done_callback(done)
 
     @asyncio.coroutine
@@ -65,7 +68,7 @@ class MpClientWindow(Gtk.Window):
 
         resultyielder = self.client.repeat(0)
         # harr, dropping the future. does not matter.
-        # print("repeat=0 yielded %r"%(yield from result))
+        # print("repeat=0 yielded %r"%(yield from resultyielder))
 
         print("current song: %r"%(yield from self.client.currentsong()))
         print("status: %r"%(yield from self.client.status()))
@@ -104,6 +107,6 @@ win.connect("delete-event", Gtk.main_quit)
 win.show_all()
 
 loop = asyncio.get_event_loop()
-loop.run_until_complete(newmain())
+#loop.run_until_complete(newmain())
 
 loop.run_forever()

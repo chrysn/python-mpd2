@@ -39,23 +39,8 @@ ERROR_PREFIX = "ACK "
 SUCCESS = "OK"
 NEXT = "list_OK"
 
-IS_PYTHON2 = sys.version_info < (3, 0)
-if IS_PYTHON2:
-    decode_str = lambda s: s.decode("utf-8")
-    encode_str = lambda s: s if type(s) == str else (unicode(s)).encode("utf-8")
-else:
-    decode_str = lambda s: s
-    encode_str = lambda s: str(s)
-
-try:
-    from logging import NullHandler
-except ImportError: # NullHandler was introduced in python2.7
-    class NullHandler(logging.Handler):
-        def emit(self, record):
-            pass
-
 logger = logging.getLogger(__name__)
-logger.addHandler(NullHandler())
+logger.addHandler(logging.NullHandler())
 
 class MPDError(Exception):
     pass
@@ -232,16 +217,46 @@ class MultilineFuture(asyncio.Future):
                     return
             yield self._nextline
 
+    @coroutine
+    def conext(self):
+        """As an alternative to the cursor = yield from .lines / line = yield
+        from cursor construction, the MultilineFuture offers a .conext() method
+        in analogy to .next(). As the StopIteration that would normally be
+        passed out if the generator is exhausted is used internally in
+        generators, MultilineFuture.StopIteration has to be caught instead."""
+
+        if not self._firstline.done():
+            try:
+                yield from self._firstline
+            except asyncio.CancelledError:
+                raise self.StopIteration
+            self._nextline = asyncio.Future()
+        if self.done():
+            if self.backlog:
+                return self.backlog.pop(0)
+            else:
+                raise self.StopIteration
+        try:
+            result = yield from self._nextline
+            self._nextline = asyncio.Future()
+            return result
+        except asyncio.CancelledError:
+            raise self.StopIteration
+
+    class StopIteration(BaseException):
+        """Exception for catching MultilineFuture.conext() end-of-iterator
+        situations."""
+
     def send_line(self, line):
         self.backlog.append(line)
-        if self._firstline is not None and not self._firstline.done():
+        if not self._firstline.done():
             self._firstline.set_result(None)
         elif self._nextline is not None:
             self._nextline.set_result(self.backlog.pop(0))
 
     def set_completed(self):
         print("set completed")
-        if self._firstline is not None:
+        if not self._firstline.done():
             self._firstline.cancel()
         if self._nextline is not None:
             # this must not give an index error, that's why we always keep an
@@ -250,7 +265,7 @@ class MultilineFuture(asyncio.Future):
         self.set_result(self.backlog)
 
     def set_exception(self, exc):
-        if self._firstline is not None:
+        if self._firstline.done():
             self._firstline.set_exception(exc)
         super().set_exception(exc)
 
@@ -283,7 +298,7 @@ class MPDProtocol(asyncio.StreamReaderProtocol):
 
     @coroutine
     def main_loop(self, reader, writer):
-        first_line = yield from reader.readline()
+        self.first_line = yield from reader.readline()
 
         self._writer = writer
         self._can_send = True
@@ -298,8 +313,8 @@ class MPDProtocol(asyncio.StreamReaderProtocol):
             command_processor = self._processorqueue.pop(0)
 
             while not command_processor.done():
-                yield from asyncio.sleep(1.0)
-                l = (yield from reader.readline()).decode('utf8')
+                yield from asyncio.sleep(0.1)
+                l = (yield from reader.readline()).decode('utf8').rstrip('\n')
                 print("raw line %r"%l)
                 if l.strip() == SUCCESS:
                     command_processor.set_completed()
@@ -310,17 +325,24 @@ class MPDProtocol(asyncio.StreamReaderProtocol):
 
     def send_command(self, command):
         """Immediately send the `command`, and return a MultilineFuture that
-        will contain the command's response"""
-        command_encoded = ("%s\n"%command).encode('utf8')
+        will contain the command's response."""
+
+        self.send_line(command)
+
+        return self.enqueue_command_processor()
+
+    def send_line(self, line):
+        """Like send_command, but will not enqueue a new command processor. Use
+        only when you explicitly enqueue a processor afterwards."""
+
+        line_encoded = ("%s\n"%line).encode('utf8')
 
         if self._can_send:
-            self._writer.write(command_encoded)
+            self._writer.write(line_encoded)
         else:
-            self._command_backlog.append(command_encoded)
+            self._command_backlog.append(line_encoded)
 
-        return self._enqueue_command_processor()
-
-    def _enqueue_command_processor(self):
+    def enqueue_command_processor(self):
         """Call this whenever you sent a command on its way; it returns a
         MultilineFuture that will yield the responses."""
 
@@ -333,92 +355,11 @@ class MPDProtocol(asyncio.StreamReaderProtocol):
 
 
 
-
-
-
-class LineEater(asyncio.Future):
-    """Future on a generator that gets fed lines
-
-    The LineEater is a Future that can be used to dispatch lines in a protocol
-    where different routines take turns in consuming lines, but only those
-    routines can determine whether they are done with it. (That's not exactly
-    the case in the MPD protocol, but makes adapting the current implementation
-    easier).
-
-    The generators used here are *not* coroutines -- while coroutines yield
-    futures (for whose completion they wait and whose values they get passed
-    back in), these generators yield nothing, and wait for a next line to be
-    passed in. This allows orderly execution: When it is a LineEater's turn to
-    consume lines, `feed` it lines until it returns False, which means that the
-    generator has ended and that the next eater in line should receive
-    subsequent lines.
-
-    When the generator exits, its result will be used to finish the future
-    which the LineEater is. (In case of an error, that will set an exception on
-    the future).
-
-    Note that the generators inside a LineEater can easily nest using `yield
-    from` the same way a asyncio.coroutine nests. Instead of an innermost
-    `yield from my_socket.read()` (which leads to competition among tasks),
-    there is simply a `yield`.
-    """
-
-    def __init__(self, generator):
-        super().__init__()
-
-        self._generator = generator
-
-    def feed(self, line):
-        try:
-            self._generator.send(line)
-        except StopIteration as s:
-            self.set_result(s.value)
-            return False
-        except Exception as e:
-            self.set_exception(e)
-            return False
-
-        return True
-
 class MPDClient(object):
-    def __init__(self, use_unicode=False):
-        self.iterate = False
-        self.use_unicode = use_unicode
-        self._readtask = None
+    def __init__(self):
         self._reset()
 
-    def _send(self, command, args, retval):
-        if self._command_list is not None:
-            raise CommandListError("Cannot use send_%s in a command list" %
-                                   command)
-        self._write_command(command, args)
-        if retval is not None:
-            self._pending.append(command)
-
-    def _fetch(self, command, args, retval):
-        if self._command_list is not None:
-            raise CommandListError("Cannot use fetch_%s in a command list" %
-                                   command)
-        if self._iterating:
-            raise IteratingError("Cannot use fetch_%s while iterating" %
-                                 command)
-        if not self._pending:
-            raise PendingCommandError("No pending commands to fetch")
-        if self._pending[0] != command:
-            raise PendingCommandError("'%s' is not the currently "
-                                      "pending command" % command)
-        del self._pending[0]
-        if isinstance(retval, Callable):
-            return retval()
-        return retval
-
     def _execute(self, command, args, retval):
-        if self._iterating:
-            raise IteratingError("Cannot execute '%s' while iterating" %
-                                 command)
-        if self._pending:
-            raise PendingCommandError("Cannot execute '%s' with "
-                                      "pending commands" % command)
         if self._command_list is not None:
             raise NotImplementedError() # yield from
             if not isinstance(retval, Callable):
@@ -428,42 +369,7 @@ class MPDClient(object):
             self._command_list.append(retval)
         else:
             self._write_command(command, args)
-            if isinstance(retval, Callable):
-                ## @todo implement any other case
-                return (yield from retval())
-            raise NotImplementedError() # yield from
-            return retval
-
-    def _execute_async(self, command, args, retval):
-        """Append the command and create a LineEater from the retval function.
-        See the LineEater documentation on how those should behave."""
-        self._pending = None # destroy whatever uses it so things break early.
-                             # those don't go together.
-        self._write_command(command, args)
-
-        generator = retval()
-        generator.__next__() # start generator
-
-        result = LineEater(generator)
-
-        self._lineeaters.append(result)
-
-        return result
-
-    @coroutine
-    def _feed_lineeaters(self):
-        while True:
-            line = yield from self._read_line()
-            if not self._lineeaters:
-                self.disconnect()
-                raise ConnectionError("Unexpected chatting")
-            want_more = self._lineeaters[0].feed(line)
-            if not want_more:
-                self._lineeaters.pop(0)
-
-    def _write_line(self, line):
-        self._wfile.write(("%s\n" % line).encode('utf-8'))
-        #self._wfile.flush()
+            return retval(self._protocol.enqueue_command_processor())
 
     def _write_command(self, command, args=[]):
         parts = [command]
@@ -474,59 +380,38 @@ class MPDClient(object):
                 else:
                     parts.append('"%d:%d"' % (int(arg[0]), int(arg[1])))
             else:
-                parts.append('"%s"' % escape(encode_str(arg)))
+                parts.append('"%s"' % escape(str(arg)))
         # Minimize logging cost if the logging is not activated.
         if logger.isEnabledFor(logging.DEBUG):
             if command == "password":
                 logger.debug("Calling MPD password(******)")
             else:
                 logger.debug("Calling MPD %s%r", command, args)
-        self._write_line(" ".join(parts))
+        self._protocol.send_line(" ".join(parts))
 
-    def _read_line(self):
-        ## @todo things block anyway because readline is inefficient when
-        # dealing with more data
-        line = (yield from self._rfile.readline()).decode('utf-8')
-        if self.use_unicode:
-            line = decode_str(line)
-        if not line.endswith("\n"):
-            self.disconnect()
-            raise ConnectionError("Connection lost while reading line")
-        line = line.rstrip("\n")
-        if line.startswith(ERROR_PREFIX):
-            error = line[len(ERROR_PREFIX):].strip()
-            raise CommandError(error)
-        if self._command_list is not None:
-            if line == NEXT:
-                return
-            if line == SUCCESS:
-                raise ProtocolError("Got unexpected '%s'" % SUCCESS)
-        elif line == SUCCESS:
-            return
-        return line
-
-    def _read_pair(self, separator):
-        line = yield
-        if line is None:
-            return
+    def _read_pair(self, lines, separator):
+        try:
+            line = yield from lines.conext()
+        except lines.StopIteration:
+            return None
         pair = line.split(separator, 1)
         if len(pair) < 2:
             raise ProtocolError("Could not parse pair: '%s'" % line)
         return pair
 
-    def _read_pairs(self, separator=": "):
+    def _read_pairs(self, lines, separator=": "):
         result = []
-        pair = yield from self._read_pair(separator)
+        pair = yield from self._read_pair(lines, separator)
         while pair:
             result.append(pair)
-            pair = yield from self._read_pair(separator)
+            pair = yield from self._read_pair(lines, separator)
         ## @todo form into generator shape again
         return result
 
-    def _read_list(self):
+    def _read_list(self, lines):
         seen = None
         result = []
-        for key, value in (yield from self._read_pairs()):
+        for key, value in (yield from self._read_pairs(lines)):
             if key != seen:
                 if seen is not None:
                     raise ProtocolError("Expected key '%s', got '%s'" %
@@ -543,10 +428,11 @@ class MPDClient(object):
         ## @todo form into generator shape again
         return result
 
-    def _read_objects(self, delimiters=[]):
+    @coroutine
+    def _read_objects(self, lines, delimiters=[]):
         result = []
         obj = {}
-        for key, value in (yield from self._read_pairs()):
+        for key, value in (yield from self._read_pairs(lines)):
             key = key.lower()
             if obj:
                 if key in delimiters:
@@ -564,14 +450,6 @@ class MPDClient(object):
         ## @todo form into generator shape again
         return result
 
-    def _read_command_list(self):
-        try:
-            for retval in self._command_list:
-                yield retval()
-        finally:
-            self._command_list = None
-        self._fetch_nothing()
-
     def _read_stickers(self):
         result = []
         for key, sticker in (yield from self._read_pairs()):
@@ -583,23 +461,15 @@ class MPDClient(object):
             result.append(value)
         return result
 
-    def _iterator_wrapper(self, iterator):
+    def _fetch_nothing(self, lines):
         try:
-            for item in iterator:
-                yield item
-        finally:
-            self._iterating = False
-
-    def _wrap_iterator(self, iterator):
-        ## @todo make this actually usable with asyncio
-        if not self.iterate:
-            return iterator
-        self._iterating = True
-        return self._iterator_wrapper(iterator)
-
-    def _fetch_nothing(self):
-        line = yield
-        if line is not None:
+            print("_fetch_nothing")
+            line = yield from lines.conext()
+        except lines.StopIteration:
+            print("got a stop iteration")
+            pass
+        else:
+            print("got no stop iteration")
             raise ProtocolError("Got unexpected return value: '%s'" % line)
 
     def _fetch_item(self):
@@ -616,60 +486,53 @@ class MPDClient(object):
     def _fetch_stickers(self):
         return dict(self._read_stickers())
 
-    def _fetch_list(self):
-        return self._wrap_iterator(self._read_list())
+    def _fetch_list(self, lines):
+        return self._read_list(lines)
 
     def _fetch_playlist(self):
-        return self._wrap_iterator(self._read_playlist())
+        return self._read_playlist()
 
-    def _fetch_object(self):
-        objs = list((yield from self._read_objects()))
+    @coroutine
+    def _fetch_object(self, lines):
+        objs = list((yield from self._read_objects(lines)))
         if not objs:
             return {}
         return objs[0]
 
-    def _fetch_objects(self, delimiters):
-        return self._wrap_iterator(self._read_objects(delimiters))
+    def _fetch_objects(self, lines, delimiters):
+        return self._read_objects(lines, delimiters)
 
     def _fetch_changes(self):
         return self._fetch_objects(["cpos"])
 
-    def _fetch_idle(self):
-        #self._sock.settimeout(self.idletimeout)
-        ret = self._fetch_list()
-        #self._sock.settimeout(self._timeout)
+    def _fetch_idle(self, lines):
+        ret = self._fetch_list(lines)
         return ret
 
-    def _fetch_songs(self):
-        return self._fetch_objects(["file"])
+    def _fetch_songs(self, lines):
+        return self._fetch_objects(lines, ["file"])
 
-    def _fetch_playlists(self):
-        return self._fetch_objects(["playlist"])
+    def _fetch_playlists(self, lines):
+        return self._fetch_objects(lines, ["playlist"])
 
-    def _fetch_database(self):
-        return self._fetch_objects(["file", "directory", "playlist"])
+    def _fetch_database(self, lines):
+        return self._fetch_objects(lines, ["file", "directory", "playlist"])
 
-    def _fetch_messages(self):
-        return self._fetch_objects(["channel"])
+    def _fetch_messages(self, lines):
+        return self._fetch_objects(lines, ["channel"])
 
-    def _fetch_outputs(self):
-        return self._fetch_objects(["outputid"])
+    def _fetch_outputs(self, lines):
+        return self._fetch_objects(lines, ["outputid"])
 
-    def _fetch_plugins(self):
-        return self._fetch_objects(["plugin"])
-
-    def _fetch_command_list(self):
-        return self._wrap_iterator(self._read_command_list())
+    def _fetch_plugins(self, lines):
+        return self._fetch_objects(lines, ["plugin"])
 
     def noidle(self):
-        if not self._pending or self._pending[0] != 'idle':
-          raise CommandError('cannot send noidle if send_idle was not called')
-        del self._pending[0]
         self._write_command("noidle")
         return self._fetch_list()
 
     def _hello(self):
-        line = (yield from self._rfile.readline()).decode('utf-8')
+        line = self._protocol.first_line
         if not line.endswith("\n"):
             self.disconnect()
             raise ConnectionError("Connection lost while reading MPD hello")
@@ -680,13 +543,8 @@ class MPDClient(object):
 
     def _reset(self):
         self.mpd_version = None
-        self._iterating = False
-        self._pending = []
         self._command_list = None
-        self._lineeaters = []
-        self._sock = None
-        self._rfile = _NotConnected()
-        self._wfile = _NotConnected()
+        self._protocol = None
 
     def _connect_unix(self, path):
         if not hasattr(socket, "AF_UNIX"):
@@ -697,61 +555,29 @@ class MPDClient(object):
         sock.connect(path)
         return sock
 
-    @coroutine
-    def _connect_tcp(self, host, port):
-        self._sock = True
-
-        try:
-            self._rfile, self._wfile = yield from asyncio.streams.open_connection(host, port)
-            ## @todo set sockopt SO_KEEPALIVE, and set socket timeout
-        except:
-            self._reset()
-            raise
-
-    def _settimeout(self, timeout):
-        self._timeout = timeout
-        if self._sock != None:
-            ## @todo set timeout
-            pass
-    def _gettimeout(self):
-        return self._timeout
-    timeout = property(_gettimeout, _settimeout)
-    _timeout = None
     idletimeout = None
 
-    def connect(self, host, port, timeout=None):
-        logger.info("Calling MPD connect(%r, %r, timeout=%r)", host,
-                     port, timeout)
-        if self._sock is not None:
+    @coroutine
+    def connect(self, host, port=6600):
+        logger.info("Calling MPD connect(%r, %)", host, port)
+        if self._protocol is not None:
             raise ConnectionError("Already connected")
-        if timeout != None:
-            warnings.warn("The timeout parameter in connect() is deprecated! "
-                          "Use MPDClient.timeout = yourtimeout instead.",
-                          DeprecationWarning)
-            self.timeout = timeout
+
         if host.startswith("/"):
-            self._sock = self._connect_unix(host)
+            self._protocol = self._connect_unix(host)
         else:
-            yield from self._connect_tcp(host, port)
+            self._protocol = yield from MPDProtocol.open_connection(host, port)
 
-        try:
-            yield from self._hello()
-        except Exception as e:
-            print("something went wrong: %s"%e)
-            ## @todo unqualified except!
-            self.disconnect()
-            raise
-
-        self._readtask = asyncio.Task(self._feed_lineeaters())
+        # FIXME: not sure whether it's really guaranteed that the first step of
+        # the main loop has already been run
+        #self._hello()
 
     def disconnect(self):
         logger.info("Calling MPD disconnect()")
 
-        if self._readtask:
-            self._readtask.cancel()
+        if self._protocol is not None:
+            self._protocol.disconnect()
 
-        if not self._wfile is None:
-            self._wfile.close()
         self._reset()
 
     def fileno(self):
@@ -762,41 +588,41 @@ class MPDClient(object):
     def command_list_ok_begin(self):
         if self._command_list is not None:
             raise CommandListError("Already in command list")
-        if self._iterating:
-            raise IteratingError("Cannot begin command list while iterating")
-        if self._pending:
-            raise PendingCommandError("Cannot begin command list "
-                                      "with pending commands")
         self._write_command("command_list_ok_begin")
         self._command_list = []
 
     def command_list_end(self):
         if self._command_list is None:
             raise CommandListError("Not in command list")
-        if self._iterating:
-            raise IteratingError("Already iterating over a command list")
         self._write_command("command_list_end")
-        return self._fetch_command_list()
+        cl = self._command_list
+        self._command_list = None
+        return self._command_list_dispatch(cl, self._protocol.enqueue_command_processor())
+
+    @coroutine
+    def _command_list_dispatch(self, cl, linefuture):
+        command = cl.pop(0) if cl else None
+
+        for cursor in (yield from linefuture):
+            line = yield from cursor
+
+            if command is None:
+                raise ProtocolError("Got unexpected '%r' in command list"%line)
+
+            if command.strip() == NEXT:
+                cl.set_completed()
+                command = cl.pop(0) if cl else None
+                continue
+
+            cl.send_line(line)
+        if cl is not None:
+            raise ProtocolError("Unexpected end of command list output")
 
     @classmethod
     def add_command(cls, name, callback):
         method = newFunction(cls._execute, key, callback)
-        send_method = newFunction(cls._send, key, callback)
-        fetch_method = newFunction(cls._fetch, key, callback)
-        async_method = newFunction(cls._execute_async, key, callback)
-
-        # create new mpd commands as function in three flavors:
-        # normal, with "send_"-prefix and with "fetch_"-prefix
         escaped_name = name.replace(" ", "_")
-        #setattr(cls, escaped_name, method)
-        #setattr(cls, "send_"+escaped_name, send_method)
-        #setattr(cls, "fetch_"+escaped_name, fetch_method)
-
-        # it might be worth considering to have a MPDClient class and a
-        # MPDAsyncClient class, which differ in that the async methods are
-        # hidden groundwork in the compatibility MPDClient, which instead
-        # exposes wrapper methods
-        setattr(cls, escaped_name, async_method)
+        setattr(cls, escaped_name, method)
 
     @classmethod
     def remove_command(cls, name):
