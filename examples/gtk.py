@@ -88,6 +88,15 @@ class MpClientWindow(Gtk.Window):
         print("current song: %r"%(yield from self.client.currentsong()))
         print("status: %r"%(yield from status))
 
+        print("using command sequences")
+        self.client.command_list_ok_begin()
+        cs = self.client.currentsong()
+        s = self.client.status()
+        yield from self.client.command_list_end()
+
+        print("current song: %r"%(yield from cs))
+        print("status: %r"%(yield from s))
+
         print("idle events: %r"%(yield from self.client.idle()))
 
         return 42
