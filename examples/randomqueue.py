@@ -1,12 +1,14 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # IMPORTS
+import asyncio
 from mpd import (MPDClient, CommandError)
 from random import choice
 from socket import error as SocketError
 from sys import exit
 
+run = asyncio.get_event_loop().run_until_complete
 
 ## SETTINGS
 ##
@@ -19,17 +21,17 @@ PASSWORD = False
 client = MPDClient()
 
 try:
-    client.connect(host=HOST, port=PORT)
+    run(client.connect(host=HOST, port=PORT))
 except SocketError:
     exit(1)
 
 if PASSWORD:
     try:
-        client.password(PASSWORD)
+        run(client.password(PASSWORD))
     except CommandError:
         exit(1)
 
-client.add(choice(client.list('file')))
+run(client.add(choice(list(run(client.list('file'))))))
 client.disconnect()
 
 # VIM MODLINE

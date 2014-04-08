@@ -1,12 +1,17 @@
-#!/usr/bin/python
+#!/usr/bin/python3
+
 import mpd
 
-# use_unicode will enable the utf-8 mode for python2
-# see http://pythonhosted.org/python-mpd2/topics/advanced.html#unicode-handling
-client = mpd.MPDClient(use_unicode=True)
-client.connect("localhost", 6600)
+def main():
+    client = mpd.MPDClient()
+    yield from client.connect("localhost", 6600)
 
-for entry in client.lsinfo("/"):
-    print("%s" % entry)
-for key, value in client.status().items():
-    print("%s: %s" % (key, value))
+    for entry in (yield from client.lsinfo("/")):
+        print("%s" % entry)
+    status = yield from client.status()
+    for key, value in status.items():
+        print("%s: %s" % (key, value))
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(main())
