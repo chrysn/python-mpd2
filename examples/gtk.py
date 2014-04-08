@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import sys
+
 import asyncio
 import mpd
 
@@ -73,8 +75,12 @@ class MpClientWindow(Gtk.Window):
         print("current song: %r"%(yield from self.client.currentsong()))
         print("status: %r"%(yield from self.client.status()))
 
-        result = yield from self.client.listall()
-        print("listall: %r"%len(result))
+        result = self.client.listall()
+        for cursor in (yield from result.lines):
+            listed = yield from cursor
+            print('.', end="")
+            sys.stdout.flush()
+        print("\n")
 
         print("screwing with sequence")
 
@@ -108,5 +114,8 @@ win.show_all()
 
 loop = asyncio.get_event_loop()
 #loop.run_until_complete(newmain())
+
+# workaround for main loop
+loop.call_exception_handler = lambda context: print("EXCEPTION? in %r."%context)
 
 loop.run_forever()

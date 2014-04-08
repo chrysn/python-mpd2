@@ -193,29 +193,51 @@ class MultilineFuture(asyncio.Future):
     def __init__(self):
         super().__init__()
         self.backlog = []
-        self._firstline = asyncio.Future()
-        self._nextline = None
+        self._nextfuture = asyncio.Future()
+
+    @coroutine
+    def _receive(self):
+        """Async-block until an element has been appended to the backlog."""
+        yield from self._nextfuture
+        self._nextfuture = asyncio.Future()
 
     @property
     @coroutine
     def lines(self):
-        try:
-            yield from self._firstline
-        except asyncio.CancelledError:
-            return ()
+        it = self._cursor()
 
-        return self._cursor()
+        if self.backlog:
+            return it
+        else:
+            try:
+                yield from self._receive()
+            except asyncio.CancelledError:
+                return ()
+            return it
 
     def _cursor(self):
+        """Iterator that yields a future which waits for the backlog to contain
+        an element, so the iterator can always generate an element that is safe
+        to yield from without running into cancellation."""
+
         while True:
-            if self.cancelled():
-                return
-            self._nextline = asyncio.Future()
             if len(self.backlog) > 1 or (self.backlog and self.done()):
-                self._nextline.set_result(self.backlog.pop(0))
+                f = asyncio.Future()
+                f.set_result(self.backlog.pop(0))
+                yield f
+                continue
             elif self.done():
-                    return
-            yield self._nextline
+                return
+
+            f = asyncio.Future()
+            # no matter whether _nextfuture works or fails, in all cases we have
+            # a backlog item left; and whoever set _nextfuture hopefully also
+            # made self done.
+            self._nextfuture.add_done_callback(lambda s: f.set_result(self.backlog.pop(0)))
+            yield f
+
+            if self._nextfuture.done():
+                self._nextfuture = asyncio.Future()
 
     @coroutine
     def conext(self):
@@ -225,23 +247,18 @@ class MultilineFuture(asyncio.Future):
         passed out if the generator is exhausted is used internally in
         generators, MultilineFuture.StopIteration has to be caught instead."""
 
-        if not self._firstline.done():
-            try:
-                yield from self._firstline
-            except asyncio.CancelledError:
-                raise self.StopIteration
-            self._nextline = asyncio.Future()
+        if self.backlog:
+            return self.backlog.pop(0)
+
         if self.done():
-            if self.backlog:
-                return self.backlog.pop(0)
-            else:
-                raise self.StopIteration
+            raise self.StopIteration()
+
         try:
-            result = yield from self._nextline
-            self._nextline = asyncio.Future()
-            return result
+            yield from self._receive()
         except asyncio.CancelledError:
-            raise self.StopIteration
+            raise self.StopIteration()
+
+        return self.backlog.pop(0)
 
     class StopIteration(BaseException):
         """Exception for catching MultilineFuture.conext() end-of-iterator
@@ -249,24 +266,17 @@ class MultilineFuture(asyncio.Future):
 
     def send_line(self, line):
         self.backlog.append(line)
-        if not self._firstline.done():
-            self._firstline.set_result(None)
-        elif self._nextline is not None:
-            self._nextline.set_result(self.backlog.pop(0))
+        if not self._nextfuture.done():
+            self._nextfuture.set_result(None)
 
     def set_completed(self):
-        print("set completed")
-        if not self._firstline.done():
-            self._firstline.cancel()
-        if self._nextline is not None:
-            # this must not give an index error, that's why we always keep an
-            # element in reserve
-            self._nextline.set_result(self.backlog.pop(0))
+        if not self._nextfuture.done():
+            self._nextfuture.cancel()
         self.set_result(self.backlog)
 
     def set_exception(self, exc):
-        if self._firstline.done():
-            self._firstline.set_exception(exc)
+        if not self._nextfuture.done():
+            self._nextfuture.set_exception(exc)
         super().set_exception(exc)
 
 class MPDProtocol(asyncio.StreamReaderProtocol):
@@ -313,9 +323,7 @@ class MPDProtocol(asyncio.StreamReaderProtocol):
             command_processor = self._processorqueue.pop(0)
 
             while not command_processor.done():
-                yield from asyncio.sleep(0.1)
                 l = (yield from reader.readline()).decode('utf8').rstrip('\n')
-                print("raw line %r"%l)
                 if l.strip() == SUCCESS:
                     command_processor.set_completed()
                 elif l.startswith(ERROR_PREFIX):
@@ -428,26 +436,28 @@ class MPDClient(object):
         ## @todo form into generator shape again
         return result
 
-    @coroutine
     def _read_objects(self, lines, delimiters=[]):
-        result = []
-        obj = {}
-        for key, value in (yield from self._read_pairs(lines)):
-            key = key.lower()
+        result = MultilineFuture()
+        @coroutine
+        def worker(self=self, lines=lines, delimiters=delimiters, result=result):
+            obj = {}
+            for key, value in (yield from self._read_pairs(lines)):
+                key = key.lower()
+                if obj:
+                    if key in delimiters:
+                        result.send_line(obj)
+                        obj = {}
+                    elif key in obj:
+                        if not isinstance(obj[key], list):
+                            obj[key] = [obj[key], value]
+                        else:
+                            obj[key].append(value)
+                        continue
+                obj[key] = value
             if obj:
-                if key in delimiters:
-                    result.append(obj)
-                    obj = {}
-                elif key in obj:
-                    if not isinstance(obj[key], list):
-                        obj[key] = [obj[key], value]
-                    else:
-                        obj[key].append(value)
-                    continue
-            obj[key] = value
-        if obj:
-            result.append(obj)
-        ## @todo form into generator shape again
+                result.send_line(obj)
+            result.set_completed()
+        asyncio.async(worker())
         return result
 
     def _read_stickers(self):
@@ -461,15 +471,13 @@ class MPDClient(object):
             result.append(value)
         return result
 
+    @coroutine
     def _fetch_nothing(self, lines):
         try:
-            print("_fetch_nothing")
             line = yield from lines.conext()
         except lines.StopIteration:
-            print("got a stop iteration")
             pass
         else:
-            print("got no stop iteration")
             raise ProtocolError("Got unexpected return value: '%s'" % line)
 
     def _fetch_item(self):
@@ -499,33 +507,30 @@ class MPDClient(object):
             return {}
         return objs[0]
 
-    def _fetch_objects(self, lines, delimiters):
-        return self._read_objects(lines, delimiters)
-
     def _fetch_changes(self):
-        return self._fetch_objects(["cpos"])
+        return self._read_objects(["cpos"])
 
     def _fetch_idle(self, lines):
         ret = self._fetch_list(lines)
         return ret
 
     def _fetch_songs(self, lines):
-        return self._fetch_objects(lines, ["file"])
+        return self._read_objects(lines, ["file"])
 
     def _fetch_playlists(self, lines):
-        return self._fetch_objects(lines, ["playlist"])
+        return self._read_objects(lines, ["playlist"])
 
     def _fetch_database(self, lines):
-        return self._fetch_objects(lines, ["file", "directory", "playlist"])
+        return self._read_objects(lines, ["file", "directory", "playlist"])
 
     def _fetch_messages(self, lines):
-        return self._fetch_objects(lines, ["channel"])
+        return self._read_objects(lines, ["channel"])
 
     def _fetch_outputs(self, lines):
-        return self._fetch_objects(lines, ["outputid"])
+        return self._read_objects(lines, ["outputid"])
 
     def _fetch_plugins(self, lines):
-        return self._fetch_objects(lines, ["plugin"])
+        return self._read_objects(lines, ["plugin"])
 
     def noidle(self):
         self._write_command("noidle")
