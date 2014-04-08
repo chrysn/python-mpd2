@@ -191,16 +191,6 @@ _commands = {
     "sendmessage":        "_fetch_nothing",
 }
 
-@coroutine
-def open_connection(host=None, port=6600, loop=None):
-    """A asyncio.streams.open_connection style method for MPD"""
-    if loop is None:
-        loop = asyncio.get_event_loop()
-    reader = asyncio.StreamReader(loop=loop)
-    protocol = MPDProtocol(reader, loop=loop)
-    yield from loop.create_connection(lambda: protocol, host, port)
-    return protocol
-
 class MultilineFuture(asyncio.Future):
     """A future that returns a list of lines, but also has a .nextline property
     that can be yielded from and gives line-wise results.
@@ -265,6 +255,17 @@ class MultilineFuture(asyncio.Future):
         super().set_exception(exc)
 
 class MPDProtocol(asyncio.StreamReaderProtocol):
+    @classmethod
+    @coroutine
+    def open_connection(cls, host=None, port=6600, loop=None):
+        """A asyncio.streams.open_connection style method for MPD"""
+        if loop is None:
+            loop = asyncio.get_event_loop()
+        reader = asyncio.StreamReader(loop=loop)
+        protocol = cls(reader, loop=loop)
+        yield from loop.create_connection(lambda: protocol, host, port)
+        return protocol
+
     def __init__(self, stream_reader, loop=None):
         super().__init__(stream_reader, self.main_loop, loop=loop)
 

@@ -83,6 +83,20 @@ class MpClientWindow(Gtk.Window):
 
         return 42
 
+@asyncio.coroutine
+def newmain():
+    proto = yield from mpd.MPDProtocol.open_connection('127.0.0.1', 6600)
+
+    cs = yield from proto.send_command("currentsong")
+    print("cs", cs)
+
+    #s = proto.send_command("idle")
+    s = proto.send_command("status")
+    for cursor in (yield from s.lines):
+        line = yield from cursor
+        print("result from cursor received: %r"%line)
+    print("that's all")
+
 asyncio.set_event_loop_policy(gbulb.GtkEventLoopPolicy())
 
 win = MpClientWindow()
@@ -90,5 +104,6 @@ win.connect("delete-event", Gtk.main_quit)
 win.show_all()
 
 loop = asyncio.get_event_loop()
+loop.run_until_complete(newmain())
 
 loop.run_forever()
