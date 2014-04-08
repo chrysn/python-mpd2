@@ -191,6 +191,150 @@ _commands = {
     "sendmessage":        "_fetch_nothing",
 }
 
+@coroutine
+def open_connection(host=None, port=6600, loop=None):
+    """A asyncio.streams.open_connection style method for MPD"""
+    if loop is None:
+        loop = asyncio.get_event_loop()
+    reader = asyncio.StreamReader(loop=loop)
+    protocol = MPDProtocol(reader, loop=loop)
+    yield from loop.create_connection(lambda: protocol, host, port)
+    return protocol
+
+class MultilineFuture(asyncio.Future):
+    """A future that returns a list of lines, but also has a .nextline property
+    that can be yielded from and gives line-wise results.
+
+    Lines will be delayed until the next line arrives. Thus, you can use it
+    like
+
+    >>> f = MultilineFuture()
+    >>> for cursor in (yield from f.lines):
+    >>>     line = yield from cursor
+
+    and the iteration will stop with the last item when fed via
+    `f.send_line(line)` and `f.set_completed()`."""
+
+    def __init__(self):
+        super().__init__()
+        self.backlog = []
+        self._firstline = asyncio.Future()
+        self._nextline = None
+
+    @property
+    @coroutine
+    def lines(self):
+        try:
+            yield from self._firstline
+        except asyncio.CancelledError:
+            return ()
+
+        return self._cursor()
+
+    def _cursor(self):
+        while True:
+            if self.cancelled():
+                return
+            self._nextline = asyncio.Future()
+            if len(self.backlog) > 1 or (self.backlog and self.done()):
+                self._nextline.set_result(self.backlog.pop(0))
+            elif self.done():
+                    return
+            yield self._nextline
+
+    def send_line(self, line):
+        self.backlog.append(line)
+        if self._firstline is not None and not self._firstline.done():
+            self._firstline.set_result(None)
+        elif self._nextline is not None:
+            self._nextline.set_result(self.backlog.pop(0))
+
+    def set_completed(self):
+        print("set completed")
+        if self._firstline is not None:
+            self._firstline.cancel()
+        if self._nextline is not None:
+            # this must not give an index error, that's why we always keep an
+            # element in reserve
+            self._nextline.set_result(self.backlog.pop(0))
+        self.set_result(self.backlog)
+
+    def set_exception(self, exc):
+        if self._firstline is not None:
+            self._firstline.set_exception(exc)
+        super().set_exception(exc)
+
+class MPDProtocol(asyncio.StreamReaderProtocol):
+    def __init__(self, stream_reader, loop=None):
+        super().__init__(stream_reader, self.main_loop, loop=loop)
+
+        # this property group will be more important when the
+        # pause_/resume_writing calls are implemented. then, there can be an
+        # async-blocking send_command too, which will wait for the send queue
+        # to be free (halting control flow in whatever generates that many
+        # command writes instead of appending and appending to the queue).
+        self._writer = None
+        self._can_send = False
+        self._command_backlog = []
+
+        self._processorqueue = []
+        self._processorqueue_next = asyncio.Future()
+
+    @coroutine
+    def main_loop(self, reader, writer):
+        first_line = yield from reader.readline()
+
+        self._writer = writer
+        self._can_send = True
+        while self._command_backlog:
+            writer.write(self._command_backlog.pop(0))
+
+        while True:
+            while not self._processorqueue:
+                yield from self._processorqueue_next
+                self._processorqueue_next = asyncio.Future()
+
+            command_processor = self._processorqueue.pop(0)
+
+            while not command_processor.done():
+                yield from asyncio.sleep(1.0)
+                l = (yield from reader.readline()).decode('utf8')
+                print("raw line %r"%l)
+                if l.strip() == SUCCESS:
+                    command_processor.set_completed()
+                elif l.startswith(ERROR_PREFIX):
+                    command_processor.set_exception(CommandError(l))
+                else:
+                    command_processor.send_line(l)
+
+    def send_command(self, command):
+        """Immediately send the `command`, and return a MultilineFuture that
+        will contain the command's response"""
+        command_encoded = ("%s\n"%command).encode('utf8')
+
+        if self._can_send:
+            self._writer.write(command_encoded)
+        else:
+            self._command_backlog.append(command_encoded)
+
+        return self._enqueue_command_processor()
+
+    def _enqueue_command_processor(self):
+        """Call this whenever you sent a command on its way; it returns a
+        MultilineFuture that will yield the responses."""
+
+        f = MultilineFuture()
+        self._processorqueue.append(f)
+        if not self._processorqueue_next.done():
+            self._processorqueue_next.set_result(None)
+
+        return f
+
+
+
+
+
+
 class LineEater(asyncio.Future):
     """Future on a generator that gets fed lines
 
