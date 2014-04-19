@@ -379,7 +379,7 @@ class MPDProtocol(asyncio.StreamReaderProtocol):
         # FIXME how should this be done?
         pass
 
-class MPDClient(object):
+class AsyncMPDClient(object):
     def __init__(self):
         self._reset()
 
@@ -641,6 +641,75 @@ class MPDClient(object):
         name = name.replace(" ", "_")
         delattr(cls, str(name))
 
+def _blockingwrapped(function, doc=None):
+    def wrapped(*args, **kwargs):
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(function(*args, **kwargs))
+    if doc:
+        wrapped.__doc__ = doc
+    return wrapped
+
+class MPDClient(AsyncMPDClient):
+    """Compatibility functions around AsyncMPDClient that wraps calls that
+    would return futures into loop.run_until_complete."""
+    def __init__(self):
+        super(MPDClient, self).__init__()
+
+        self.iterate = False
+
+        # (command name, future) tuples used to emulate send_/fetch_ behavior
+        self.command_backlog = []
+
+    connect = _blockingwrapped(AsyncMPDClient.connect, "Connect to a given"
+            "server / port and block until the connection is established. (For"
+            "details, see the AsyncMPDClient.connect method).")
+
+    def _return_results(self, future):
+        """Usually, block until the future is done, and return its result. If
+        the future is a MultilineFuture and the client is set to iterate, a
+        generator that blocks on each iteration is returned. That generator,
+        when converted to a list, equals what _return_results usually
+        returns."""
+
+        loop = asyncio.get_event_loop()
+        if self.iterate and isinstance(future, MultilineFuture):
+            return self._return_multi_results(future)
+        else:
+            return loop.run_until_complete(future)
+
+    def _return_multi_results(self, multilinefuture):
+        """Generator that blocks when consumed until a the next line in a
+        multilinefutre is ready"""
+
+        loop = asyncio.get_event_loop()
+        for f in multilinefuture.lines:
+            yield loop.run_until_complete(f)
+
+    @classmethod
+    def add_command(cls, name, callback):
+        escaped_name = name.replace(" ", "_")
+        original_method = getattr(AsyncMPDClient, escaped_name)
+        def blocking_method(self, *args, **kwargs):
+            return self._return_results(original_method(self, *args, **kwargs))
+        setattr(cls, escaped_name, blocking_method)
+        def sending_method(self, *args, **kwargs):
+            future = original_method(self, *args, **kwargs)
+            self.command_backlog.append((name, future))
+        setattr(cls, "send_" + escaped_name, sending_method)
+        def fetching_method(self, *args, **kwargs):
+            try:
+                enqueued_name, future = self.command_backlog.pop(0)
+            except IndexError:
+                raise PendingCommandError("No pending command")
+
+            if enqueued_name != name:
+                # is KeyError the right exception here?
+                raise KeyError("'%s' is not the currently "
+                        "pending command"%command)
+
+            return self._return_results(future)
+        setattr(cls, "fetch_" + escaped_name, fetching_method)
+
 def bound_decorator(self, function):
     """ bind decorator to self """
     if not isinstance(function, Callable):
@@ -656,7 +725,8 @@ def newFunction(wrapper, name, returnValue):
     return decorator
 
 for key, value in _commands.items():
-    returnValue = None if value is None else MPDClient.__dict__[value]
+    returnValue = None if value is None else AsyncMPDClient.__dict__[value]
+    AsyncMPDClient.add_command(key, returnValue)
     MPDClient.add_command(key, returnValue)
 
 def escape(text):
