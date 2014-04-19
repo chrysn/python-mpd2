@@ -640,8 +640,6 @@ class MPDClient(object):
             raise ValueError("Can't remove not existent '%s' command" % name)
         name = name.replace(" ", "_")
         delattr(cls, str(name))
-        delattr(cls, str("send_" + name))
-        delattr(cls, str("fetch_" + name))
 
 def bound_decorator(self, function):
     """ bind decorator to self """
