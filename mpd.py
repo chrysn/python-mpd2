@@ -661,6 +661,9 @@ class MPDClient(AsyncMPDClient):
         # (command name, future) tuples used to emulate send_/fetch_ behavior
         self.command_backlog = []
 
+        # don't use this to decide whether we're inside a command list
+        self.command_list_backlog = []
+
     connect = _blockingwrapped(AsyncMPDClient.connect, "Connect to a given"
             "server / port and block until the connection is established. (For"
             "details, see the AsyncMPDClient.connect method).")
@@ -676,7 +679,22 @@ class MPDClient(AsyncMPDClient):
         if self.iterate and isinstance(future, MultilineFuture):
             return self._return_multi_results(future)
         else:
+            if self._command_list is not None:
+                self.command_list_backlog.append(future)
+                return None
             return loop.run_until_complete(future)
+
+    def command_list_end(self):
+        command_future = super(MPDClient, self).command_list_end()
+
+        loop = asyncio.get_event_loop()
+        none = loop.run_until_complete(command_future)
+        assert none is None
+
+        bl = self.command_list_backlog
+        self.commad_list_backlog = []
+
+        return [loop.run_until_complete(c) for c in bl]
 
     def _return_multi_results(self, multilinefuture):
         """Generator that blocks when consumed until a the next line in a
