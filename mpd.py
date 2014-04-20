@@ -572,7 +572,7 @@ class AsyncMPDClient(object):
 
     @coroutine
     def connect(self, host, port=6600):
-        logger.info("Calling MPD connect(%r, %)", host, port)
+        logger.info("Calling MPD connect(%r, %r)", host, port)
         if self._protocol is not None:
             raise ConnectionError("Already connected")
 
