@@ -383,8 +383,12 @@ class AsyncMPDClient(object):
     def __init__(self):
         self._reset()
 
+    @property
+    def command_list_active(self):
+        return self._command_list is not None
+
     def _execute(self, command, args, retval):
-        if self._command_list is not None:
+        if self.command_list_active:
             retval_input = MultilineFuture()
             f = retval(retval_input)
             self._write_command(command, args)
@@ -596,13 +600,13 @@ class AsyncMPDClient(object):
         are only executed when `command_list_end()` is called later. Be careful
         not to yield from the results you get back from commands issued inside
         a command list before you ended the command list!"""
-        if self._command_list is not None:
+        if self.command_list_active:
             raise CommandListError("Already in command list")
         self._write_command("command_list_ok_begin")
         self._command_list = []
 
     def command_list_end(self):
-        if self._command_list is None:
+        if not self.command_list_active:
             raise CommandListError("Not in command list")
         self._write_command("command_list_end")
         cl = self._command_list
@@ -679,7 +683,7 @@ class MPDClient(AsyncMPDClient):
         if self.iterate and isinstance(future, MultilineFuture):
             return self._return_multi_results(future)
         else:
-            if self._command_list is not None:
+            if self.command_list_active:
                 self.command_list_backlog.append(future)
                 return None
             return loop.run_until_complete(future)
