@@ -34,7 +34,7 @@ class MpClientWindow(Gtk.Window):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.client = mpd.MPDClient()
+        self.client = mpd.AsyncMPDClient()
 
         vbox = Gtk.VBox()
 
