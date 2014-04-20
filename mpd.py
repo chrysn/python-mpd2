@@ -652,7 +652,8 @@ def _blockingwrapped(function, doc=None):
 class MPDClient(AsyncMPDClient):
     """Compatibility functions around AsyncMPDClient that wraps calls that
     would return futures into loop.run_until_complete."""
-    def __init__(self):
+    def __init__(self, use_unicode=False):
+        """Compatibility constructor (the use_unicode flag is ignored)"""
         super(MPDClient, self).__init__()
 
         self.iterate = False
@@ -682,7 +683,7 @@ class MPDClient(AsyncMPDClient):
         multilinefutre is ready"""
 
         loop = asyncio.get_event_loop()
-        for f in multilinefuture.lines:
+        for f in loop.run_until_complete(multilinefuture.lines):
             yield loop.run_until_complete(f)
 
     @classmethod
